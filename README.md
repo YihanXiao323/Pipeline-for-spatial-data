@@ -2,7 +2,6 @@
 title: "README.md"
 author: "YihanXiao"
 date: "4/19/2021"
-output: html_document
 ---
 
 ```{r setup, include=FALSE}
