@@ -1,0 +1,758 @@
+if (!requireNamespace("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+
+BiocManager::install("scHOT")
+
+#setup
+source("Cell-cell-interaction/extrafunction.R")
+source("Cell-cell-interaction/functions.R")
+tol12qualitative=c("#332288", "#6699CC", "#88CCEE", "#44AA99", "#117733", "#999933", "#DDCC77", "#661100", "#CC6677", "#AA4466", "#882255", "#AA4499")
+if (!file.exists("output")) {
+  system("mkdir output")
+}
+parallel = TRUE
+ncores = 10
+#pack
+library(scHOT)
+library(DCARS)
+library(ggplot2)
+library(gplots)
+library(SingleCellExperiment)
+library(scater)
+library(scran)
+library(reshape)
+library(scattermore)
+library(dynamicTreeCut)
+library(stringr)
+library(matrixStats)
+library(ggforce)
+library(patchwork)
+library(cowplot)
+library(parallel)
+library(GGally)
+library(corrplot)
+library(UpSetR)
+library(GO.db)
+
+#library(ComplexHeatmap)
+#library(org.Mm.eg.db)
+#library(ggpubr)
+setwd("/mnt/Storage/home/xiaoyihan/")
+
+#data preparation
+#download MOB
+if (!file.exists("Exampledata/MOB/counts_coords.RData")) {
+  
+  # data file URL https://www.spatialresearch.org/wp-content/uploads/2016/07/Rep11_MOB_count_matrix-1.tsv
+  # might take a minute to download
+  counts_raw = read.delim(url("https://www.spatialresearch.org/wp-content/uploads/2016/07/Rep11_MOB_count_matrix-1.tsv"), header = TRUE, row.names = 1)
+  # counts_raw = read.delim(file = "Rep11_MOB_count_matrix-1.tsv", header = TRUE, row.names = 1)
+  dim(counts_raw)
+  
+  coords_raw = do.call(rbind, strsplit(rownames(counts_raw), "x"))
+  # xy plane only
+  
+  coords = apply(coords_raw, 1:2, as.numeric)
+  colnames(coords) <- c("x","y")
+  rownames(coords) <- rownames(counts_raw)
+  
+  plot(coords[,"x"], coords[,"y"])
+  
+  counts = t(counts_raw)
+  
+  sce = SingleCellExperiment(assays = list(counts = counts),
+                             colData = coords)
+  sce <- scater::logNormCounts(sce)
+  
+  means <- rowMeans(logcounts(sce))
+  vars <- rowVars(logcounts(sce))
+  fit <- fitTrendVar(means, vars)
+  var.out <- modelGeneVar(sce)
+  
+  pdf(file = "HVG_selection.pdf", height = 8, width = 8)
+  plot(means, vars, pch=16, cex=0.5, xlab="Mean", ylab="Variance")
+  curve(fit$trend(x), add=TRUE, col="dodgerblue", lwd=3)
+  seqvals = seq(min(means), max(means), length.out = 1000)
+  peakExp = seqvals[which.max(fit$trend(seqvals))]
+  
+  hvg.out <- var.out[which(var.out$FDR <= 0.05 & var.out$mean > peakExp),]
+  nrow(hvg.out)#64
+  hvg.out <- hvg.out[order(hvg.out$bio, decreasing=TRUE),] 
+  points(var.out$mean[which(var.out$FDR <= 0.05 & var.out$mean > peakExp)], 
+         var.out$total[which(var.out$FDR <= 0.05 & var.out$mean > peakExp)], col="red", pch=16)
+  abline(v = peakExp, lty = 2, col = "black")
+  dev.off()
+  
+  head(hvg.out)
+  
+  HVG = sort(rownames(hvg.out))
+  
+  expr = logcounts(sce)
+  
+  save(counts, coords, sce, HVG, expr, file = "Exampledata/MOB/counts_coords.RData")
+} else {
+  load("Exampledata/MOB/counts_coords.RData")
+}
+
+
+W = weightMatrix_nD(coords, span = 0.05)#weight matrix
+#Test for spatial differential expression and remove
+samepairs = cbind(rownames(expr), rownames(expr))
+rownames(samepairs) = samepairs[,1]
+if (!file.exists("Exampledata/schot/DE_stats_all.Rds")) {
+  DE_stats_all = DCARSacrossNetwork(expr,
+                                    samepairs,
+                                    W = W,
+                                    weightedConcordanceFunction = weightedMeanMatrixStats,
+                                    extractTestStatisticOnly = TRUE,
+                                    niter = 1000,
+                                    verbose = FALSE)
+  saveRDS(DE_stats_all, file = "Exampledata/schot//DE_stats_all.Rds")
+} else {
+  DE_stats_all = readRDS("Exampledata/schot/DE_stats_all.Rds")
+}
+
+if (!file.exists("Exampledata/schot/DE_sampled_permstats.Rdata")) {
+  # Does globalCor relate to the null distribution for genes?
+  set.seed(500)
+  globalMean = rowMeans(expr)
+  pairs_sampled = samepairs[DCARS::stratifiedSample(globalMean, length = 100),]
+  
+  sampled_permstats = DCARSacrossNetwork(expr,
+                                         pairs_sampled,
+                                         W = W,
+                                         weightedConcordanceFunction = weightedMeanMatrixStats,
+                                         extractPermutationTestStatistics = TRUE,
+                                         niter = 1000,
+                                         verbose = TRUE)
+  save(sampled_permstats, pairs_sampled, globalMean, file = "Exampledata/schot/DE_sampled_permstats.Rdata")
+} else {
+  load("Exampledata/schot/DE_sampled_permstats.Rdata")
+}
+plot(globalMean[rownames(pairs_sampled)], unlist(lapply(unlist(sampled_permstats, recursive = FALSE),quantile, 0.99)))
+points(globalMean[rownames(pairs_sampled)], unlist(lapply(unlist(sampled_permstats, recursive = FALSE),quantile, 0.95)), col = "red")
+points(globalMean[rownames(pairs_sampled)], unlist(lapply(unlist(sampled_permstats, recursive = FALSE),quantile, 0.90)), col = "blue")
+
+
+
+if (!file.exists("Exampledata/schot/DE_n100_permstats.Rds")) {
+  set.seed(500)
+  if (!parallel) {
+    n100_permstats = DCARSacrossNetwork(expr,
+                                        samepairs,
+                                        W = W,
+                                        weightedConcordanceFunction = weightedMeanMatrixStats,
+                                        extractPermutationTestStatistics = TRUE,
+                                        niter = 100,
+                                        verbose = TRUE)
+  } else {
+    split_df = split.data.frame(samepairs, rep(1:ncores, length.out = nrow(samepairs)))
+    names(split_df) <- NULL
+    n100_permstats = mclapply(split_df, function(s) {
+      res = DCARSacrossNetwork(expr,
+                               s,
+                               W = W,
+                               weightedConcordanceFunction = weightedMeanMatrixStats,
+                               extractPermutationTestStatistics = TRUE,
+                               niter = 100,
+                               verbose = TRUE)
+      res = lapply(res, unlist)
+      names(res) <- rownames(s)
+      return(res)
+    })
+    n100_permstats = unlist(n100_permstats, recursive = FALSE)
+    n100_permstats <- n100_permstats[rownames(samepairs)]
+  }
+  saveRDS(n100_permstats, file = "Exampledata/schot/DE_n100_permstats.Rds")
+} else {
+  n100_permstats = readRDS("Exampledata/schot/DE_n100_permstats.Rds")
+}
+n100_pval = sapply(names(DE_stats_all), function(gene){
+  mean(unlist(n100_permstats[[gene]]) >= DE_stats_all[gene])
+})
+# recalculate p-value for those with pval < 0.1 with 1000 iter
+# aim is to remove these genes at p-value < 0.05 level
+if (!file.exists("Exampledata/schot/DE_n1000_pval.Rds")) {
+  set.seed(500)
+  if (!parallel) {
+    n1000_pval = DCARSacrossNetwork(expr,
+                                    samepairs[n100_pval < 0.1,],
+                                    W = W,
+                                    weightedConcordanceFunction = weightedMeanMatrixStats,
+                                    niter = 1000,
+                                    verbose = TRUE)
+  } else {
+    split_df = split.data.frame(samepairs[n100_pval < 0.1,], rep(1:ncores, length.out = nrow(samepairs[n100_pval < 0.1,])))
+    names(split_df) <- NULL
+    n1000_pval = mclapply(split_df, function(s) {
+      res = DCARSacrossNetwork(expr,
+                               s,
+                               W = W,
+                               weightedConcordanceFunction = weightedMeanMatrixStats,
+                               niter = 1000,
+                               verbose = TRUE)
+      res = lapply(res, unlist)
+      names(res) <- rownames(s)
+      return(res)
+    })
+    n1000_pval = unlist(n1000_pval)
+    n1000_pval <- n1000_pval[rownames(samepairs[n100_pval<0.1,])]
+  } 
+  saveRDS(n1000_pval, file = "Exampledata/schot/DE_n1000_pval.Rds")
+} else {
+  n1000_pval = readRDS("Exampledata/schot/DE_n1000_pval.Rds")
+}
+
+DE_pval = n100_pval
+DE_pval[names(n1000_pval)] <- n1000_pval
+DE_fdr = p.adjust(DE_pval, method = "BH")
+nonDEgenes_fdr = names(which(DE_fdr > 0.05))
+saveRDS(nonDEgenes_fdr, file = "Exampledata/schot/nonDEgenes_fdr.Rds")
+nonDEgenes = names(which(DE_pval > 0.05))
+saveRDS(nonDEgenes, file = "Exampledata/schot/nonDEgenes.Rds")
+
+# Perform scHOT spatial correlation testing
+
+pairs = t(combn(intersect(HVG, nonDEgenes),2))
+rownames(pairs) <- apply(pairs,1,paste0,collapse = "_")
+dim(pairs)
+if (!file.exists("Exampledata/schot/sampled_permstats.Rdata")) {
+  set.seed(500)
+  # Does globalCor relate to the null distribution for genes?
+  globalCor = apply(pairs, 1, function(x) cor(counts[x[1],], counts[x[2],], method = "spearman"))
+  pairs_sampled = pairs[DCARS::stratifiedSample(globalCor, length = 200),]
+  
+  if (!parallel) {
+    sampled_permstats = DCARSacrossNetwork(counts,
+                                           pairs_sampled,
+                                           W = W,
+                                           weightedConcordanceFunction = weightedSpearman,
+                                           extractPermutationTestStatistics = TRUE,
+                                           niter = 1000,
+                                           verbose = TRUE)
+  } else {
+    split_df = split.data.frame(pairs_sampled, rep(1:ncores, length.out = nrow(pairs_sampled)))
+    names(split_df) <- NULL
+    sampled_permstats = mclapply(split_df, function(s) {
+      res = DCARSacrossNetwork(counts,
+                               s,
+                               W = W,
+                               weightedConcordanceFunction = weightedSpearman,
+                               extractPermutationTestStatistics = TRUE,
+                               niter = 1000,
+                               verbose = TRUE)
+      res = lapply(res, unlist)
+      names(res) <- rownames(s)
+      return(res)
+    })
+    sampled_permstats = unlist(sampled_permstats, recursive = FALSE)
+    sampled_permstats <- sampled_permstats[rownames(pairs_sampled)]
+  }
+  save(sampled_permstats, pairs_sampled, globalCor, file = "Exampledata/schot/sampled_permstats.Rdata")
+} else {
+  load("Exampledata/schot/sampled_permstats.Rdata")
+}
+permstatsDF = data.frame(
+  genepair = rep(names(sampled_permstats), times = unlist(lapply(sampled_permstats, function(x) length(unlist(x))))), 
+  stat = unlist(sampled_permstats)
+)
+permstatsDF$globalCor = globalCor[as.character(permstatsDF$genepair)]
+df_99 = data.frame(
+  genepair = names(sampled_permstats),
+  globalCor = globalCor[names(sampled_permstats)],
+  stat_999 = unlist(lapply(sampled_permstats, function(x) quantile(unlist(x), 0.999))),
+  stat_99 = unlist(lapply(sampled_permstats, function(x) quantile(unlist(x), 0.99))),
+  stat_95 = unlist(lapply(sampled_permstats, function(x) quantile(unlist(x), 0.95))),
+  stat_90 = unlist(lapply(sampled_permstats, function(x) quantile(unlist(x), 0.90)))
+)
+df_99$fitted_999 = loess(stat_999 ~ globalCor, data = df_99)$fitted
+df_99$fitted_99 = loess(stat_99 ~ globalCor, data = df_99)$fitted
+df_99$fitted_95 = loess(stat_95 ~ globalCor, data = df_99)$fitted
+df_99$fitted_90 = loess(stat_90 ~ globalCor, data = df_99)$fitted
+g = ggplot(permstatsDF, aes(x = globalCor, y = stat)) + 
+  theme_classic() +
+  geom_scattermore() +
+  geom_point(aes(y = stat_999, colour = "0.999"), data = df_99) + 
+  geom_line(aes(y = fitted_999, colour = "0.999"), data = df_99) +
+  geom_point(aes(y = stat_99, colour = "0.99"), data = df_99) + 
+  geom_line(aes(y = fitted_99, colour = "0.99"), data = df_99) +
+  geom_point(aes(y = stat_95, colour = "0.95"), data = df_99) + 
+  geom_line(aes(y = fitted_95, colour = "0.95"), data = df_99) +
+  geom_point(aes(y = stat_90, colour = "0.90"), data = df_99) + 
+  geom_line(aes(y = fitted_90, colour = "0.90"), data = df_99) + 
+  scale_colour_manual(values = c("0.999" = tol12qualitative[4],
+                                 "0.99" = tol12qualitative[3],
+                                 "0.95" = tol12qualitative[2],
+                                 "0.90" = tol12qualitative[1])) +
+  labs(colour = "Quantile") +
+  theme(panel.grid = element_blank()) +
+  xlab("Global Correlation") +
+  ylab("Permuted test statistics") +
+  theme(legend.position = "bottom")
+g
+ggsave(g, file = "Exampledata/Results/stats_globalCor_2d.pdf", height = 8, width = 8)
+
+if (!file.exists("Exampledata/schot/2D_p_all.Rdata")) {
+  # estimate the set of p-values
+  stats_all = DCARSacrossNetwork(counts,
+                                 pairs,
+                                 W = W,
+                                 weightedConcordanceFunction = weightedSpearman,
+                                 extractTestStatisticOnly = TRUE,
+                                 niter = 1000,
+                                 verbose = TRUE)
+  
+  wcors_all = t(DCARSacrossNetwork(counts,
+                                   pairs,
+                                   W = W,
+                                   weightedConcordanceFunction = weightedSpearman,
+                                   extractWcorSequenceOnly = TRUE,
+                                   niter = 1000,
+                                   verbose = TRUE))
+  
+  p_all = estimatePvaluesSpearman(stats_all, 
+                                  globalCor, 
+                                  sampled_permstats,
+                                  usenperm = TRUE,
+                                  nperm = 10000,
+                                  plot = FALSE,
+                                  maxDist = 2,
+                                  verbose = TRUE)
+  p_all$fdr <- p.adjust(p_all$pval, method = "BH")
+  
+  save(p_all, stats_all, wcors_all, file = "Exampledata/schot/2D_p_all.Rdata")
+} else {
+  load("Exampledata/schot/2D_p_all.Rdata")
+}
+p_all$gene1 = unlist(lapply(strsplit(as.character(p_all$genepair), "_"), "[", 1))
+p_all$gene2 = unlist(lapply(strsplit(as.character(p_all$genepair), "_"), "[", 2))
+# differentially expressed genes to remove
+p_all$spatiallyDE = ifelse(as.character(p_all$gene1) %in% nonDEgenes & as.character(p_all$gene2) %in% nonDEgenes,"No", "DE")
+dim(subset(p_all, spatiallyDE == "No"))
+nonDEfdr = p_all$pval
+nonDEfdr[p_all$spatiallyDE == "DE"] <- NA
+nonDEfdr = p.adjust(nonDEfdr, method = "BH")
+nonDEfdr[is.na(nonDEfdr)] <- 1
+p_all$nonDEfdr = nonDEfdr
+
+
+FDR_level = 0.2
+wcorsSig = wcors_all[p_all$nonDEfdr < FDR_level,]
+pairsSig = p_all$genepair[p_all$nonDEfdr < FDR_level]
+dim(wcorsSig)
+# basic plot functions of sig pairs
+apply(pairsSig,1, function(p) {
+  #print(p)
+  if (!file.exists("Exampledata/Results/basicplots")) {
+    system("mkdir Exampledata/Results/basicplots")
+  }
+  pdf(paste0("Exampledata/Results/basicplots", p[1], "_", p[2], ".pdf"),
+      height = 4.5, width = 12,onefile=FALSE)
+  basicplotFunction(p)
+  dev.off()
+})
+
+dim(wcors_all)
+
+intersect(HVG, nonDEgenes)
+
+# Interrogate significant gene pairs
+cellsCut = cutree(hclust(cordist(t(wcorsSig))), 20)
+table(cellsCut)
+sort(table(cellsCut))
+df_res = getDF(pairs[1,])
+df_res$cellsCut <- factor(cellsCut)
+ggplot(df_res, aes(x = x, y = y, fill = cellsCut, colour = cellsCut)) + 
+  geom_point(size = 7, shape = 21, stroke = 1.5, colour = "black") +
+  theme_minimal() + 
+  scale_alpha_continuous(range = c(0,0.5)) +
+  NULL
+ggsave(file = "output/cellsCluster_spatial.pdf", height = 8, width = 10)
+hc = hclust(dist(wcorsSig, method = "maximum"), method = "complete")
+genepairsClustDynamic = cutreeDynamic(
+  hc, 
+  minClusterSize = 10, 
+  method = "tree",
+  deepSplit = TRUE,
+  useMedoids = FALSE
+)
+kk = length(unique(genepairsClustDynamic))-1
+kk
+genepairsClust = cutree(hc, k = kk)
+plot(hc)
+table(genepairsClust)
+sort(table(genepairsClust))
+p_sig = cbind(p_all[names(genepairsClust),], cluster = genepairsClust)
+saveRDS(p_sig, file = "output/p_sig.Rds")
+write.table(as.matrix(sort_df(p_sig, c("cluster","genepair"))),
+            file = "output/sig_genepairs.tsv", row.names = FALSE,
+            col.names = TRUE, quote = FALSE, sep = "\t")
+write.table(as.matrix(genepairsClust), file = "output/genepairsClust.tsv", row.names = TRUE,
+            col.names = FALSE, quote = FALSE, sep = "\t")
+genepairs_split = lapply(split(names(genepairsClust), genepairsClust), function(x) t(do.call(cbind, strsplit(x, "_"))))
+genepairs_split_genes = lapply(genepairs_split, function(x) sort(unique(c(x))))
+sapply(names(genepairs_split_genes), function(i){
+  write(genepairs_split_genes[[i]], file = paste0("output/cluster_", i,".txt"))
+})
+geneClustMembers = sapply(unique(genepairsClust), function(x) 
+  unique(c(pairsSig[genepairsClust == x,])), simplify = FALSE)
+names(geneClustMembers) <- paste0("cluster_", unique(genepairsClust))
+saveRDS(geneClustMembers, file = "output/geneClustMembers.Rds")
+jacDist_pairs = expand.grid(names(geneClustMembers),names(geneClustMembers))
+jacDist_vals = apply(jacDist_pairs,1,function(x){
+  if (x[1] == x[2]) return(NA)
+  set1 = geneClustMembers[[x[1]]]
+  set2 = geneClustMembers[[x[2]]]
+  return(length(intersect(set1,set2))/length(union(set1,set2)))
+})
+jacDist = as.matrix(reshape::cast(cbind(jacDist_pairs, jacDist_vals), formula = Var2 ~ Var1, value = "jacDist_vals"))
+pdf("output/jacDist_clusters.pdf", height = 8, width = 8)
+heatmap.2(jacDist, trace = "n", main = "Jaccard distance of genes within clusters", 
+          density.info = "none",
+          key.title = "",
+          key.xlab = "Jaccard distance",
+          symm = TRUE, 
+          revC = TRUE)
+dev.off()
+meanwcorsSig = apply(wcorsSig, 2, function(x) {
+  tapply(x, genepairsClust, mean)
+})
+rownames(meanwcorsSig) <- paste0("cluster_", 1:length(unique(genepairsClust)))
+pdf("output/meanGenes_heatmap.pdf", height = 12, width = 24)
+heatmap.2(meanwcorsSig, trace = "n", col = colorRampPalette(c("blue","white","red")),
+          key.title = "",
+          key.xlab = "Mean weighted correlation",
+          main = "Mean weighted correlation of clustered genepairs")
+dev.off()
+df_res2 <- getDF(pairs[1,])
+df_res2 <- cbind(df_res2, t(meanwcorsSig))
+gList_cells <- sapply(rownames(meanwcorsSig), function(name) {
+  ggplot(df_res2, aes(x = -x, y = y, fill = get(name))) + 
+    geom_voronoi_tile(max.radius = 1) +
+    geom_point(size = 0.5, colour = "black") +
+    theme_minimal() + 
+    scale_alpha_continuous(range = c(0,0.5)) +
+    scale_fill_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1,1)) + 
+    ggtitle("") +
+    theme(legend.position = "none") +
+    theme(panel.grid = element_blank()) +
+    theme(axis.ticks = element_blank()) +
+    theme(axis.text = element_blank()) +
+    xlab("") + ylab("") +
+    theme(plot.title = element_text(hjust = 0.5)) +
+    coord_fixed() +
+    NULL
+}, simplify = FALSE)
+gAll = patchwork::wrap_plots(gList_cells, ncol = length(gList_cells)/5, nrow = 5)
+gAll
+ggsave(gAll, file = "output/genepairsClust_wcors.pdf", height = 5, width = 44)
+hc_mean_cells = hclust(dist(t(wcorsSig), method = "euclidean"), method = "complete")
+hc_mean_cells_groups = cutreeDynamic(
+  hc_mean_cells, 
+  minClusterSize = 10, 
+  method = "tree",
+  deepSplit = FALSE,
+  useMedoids = FALSE
+)
+kk_cells = length(unique(hc_mean_cells_groups))-1
+kk_cells
+hc_mean_cells_groups = cutree(hc_mean_cells, kk_cells)
+plot(hc_mean_cells)
+plot(hc_mean_cells, labels = hc_mean_cells_groups)
+hc_mean_cells_fac = factor(hc_mean_cells_groups, levels = unique(hc_mean_cells_groups[hc_mean_cells$order]))
+df_hc_mean_cells = data.frame(
+  x = coords[,1],
+  y = coords[,2],
+  hc_mean_cells = hc_mean_cells_fac
+)
+s = 1
+g_cells = ggplot(df_hc_mean_cells, aes(x = -x, y = y)) + 
+  geom_point(data = df_hc_mean_cells[,1:2], alpha = 0.2, stroke = 0, size = s, pch = 16) + 
+  geom_point(stroke = 0, size = s, pch = 16) +
+  facet_grid(hc_mean_cells~.) + 
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank()) +
+  xlab("") +
+  ylab("") +
+  coord_fixed() +
+  NULL
+g_cells
+ggsave(g_cells, file = "output/split_heatmap_cells.pdf",height = 7, width = 1.5)
+hc_mean_genepairs = hc
+hc_mean_genepairs_groups = genepairsClust
+plot(hc_mean_genepairs)
+plot(hc_mean_genepairs, labels = hc_mean_genepairs_groups)
+hc_mean_genepairs_fac = factor(hc_mean_genepairs_groups, levels = unique(hc_mean_genepairs_groups[hc_mean_genepairs$order]))
+split(names(hc_mean_genepairs_fac), hc_mean_genepairs_fac)
+write.table(sort_df(data.frame(grouping = hc_mean_genepairs_fac, cluster = names(hc_mean_genepairs_fac)), "grouping"), file = "output/hc_mean_genepairs_fac_split.txt", col.names = TRUE, row.names = FALSE, quote = FALSE, sep = "\t")
+hc_mean_meanwcorsSig = apply(wcorsSig, 2, function(x)
+  tapply(x, hc_mean_genepairs_fac, mean)
+)
+df_hc_mean_genepairs = data.frame(
+  x = rep(coords[,1],times = nrow(hc_mean_meanwcorsSig)),
+  y = rep(coords[,2],times = nrow(hc_mean_meanwcorsSig)),
+  hc_mean_genepairs = factor(rep(levels(hc_mean_genepairs_fac), each = ncol(meanwcorsSig)),
+                             levels = levels(hc_mean_genepairs_fac)),
+  hc_mean_genepairs_wc = c(t(hc_mean_meanwcorsSig))
+)
+g_mean = ggplot(df_hc_mean_genepairs, aes(x = -x, y = y, colour = hc_mean_genepairs_wc)) + 
+  geom_point(size = 0.7) +
+  facet_grid(~hc_mean_genepairs) + 
+  theme_minimal() +
+  theme(panel.grid = element_blank(),
+        axis.text = element_blank()) +
+  scale_colour_gradient2(low = "blue", mid = "white", high = "red", limits = c(-1,1)) + 
+  theme(legend.position = "none") +
+  xlab("") +
+  ylab("") +
+  coord_fixed() +
+  NULL
+g_mean
+cowplot::ggsave2(g_mean, file = "output/split_heatmap_genepairs.pdf", height = 1.3, width = 9)
+pdf("output/split_heatmap.pdf",height = 10, width = 15)
+tmat = t(wcorsSig)
+colnames(tmat) <- gsub("cluster_","", colnames(tmat))
+h = ComplexHeatmap::Heatmap(tmat, 
+                            cluster_columns = hc_mean_genepairs,
+                            cluster_rows = hc_mean_cells,
+                            row_dend_reorder = FALSE,
+                            column_dend_reorder = FALSE,
+                            row_split = kk_cells,
+                            column_split = kk,
+                            show_heatmap_legend = FALSE,
+                            show_column_names = FALSE
+)
+print(h)
+dev.off()
+grob = grid.grabExpr(draw(h))
+tmatmean = t(apply(tmat, 1, function(x) tapply(x, hc_mean_genepairs_fac, mean)))
+hh = ComplexHeatmap::Heatmap(tmatmean, cluster_columns = FALSE,
+                             cluster_rows = hc_mean_cells,
+                             row_dend_reorder = FALSE,
+                             column_dend_reorder = FALSE,
+                             row_split = kk_cells,
+                             show_heatmap_legend = FALSE,
+                             show_column_names = FALSE,
+                             column_title = "Gene pair clusters",
+                             row_title = "Cells",
+                             row_title_gp = gpar(fontsize = 20),
+                             column_title_gp = gpar(fontsize = 20),
+                             border = "black"
+)
+hh
+grobh = grid.grabExpr(draw(hh))
+pdf("output/split_heatmap_combined.pdf",height = 7, width = 11, useDingbats = FALSE)
+cowplot::plot_grid(grob, 
+                   g_cells + theme(plot.margin = margin(2,0.5,0.2,-0.5,unit = "cm")) +
+                     theme(strip.text = element_blank()), 
+                   g_mean + theme(plot.margin = margin(0,0,0,1.5, unit = "cm")) +
+                     theme(strip.text = element_blank()) +
+                     NULL
+                   , 
+                   ncol = 2,
+                   rel_heights = c(7,1),
+                   rel_widths = c(9,1))
+dev.off()
+pdf("output/split_heatmap_combined_summarised.pdf",height = 8, width = 9, useDingbats = FALSE)
+cowplot::plot_grid(grobh, 
+                   g_cells + 
+                     theme(plot.margin = margin(1.3,0.5,-0.2,-0.5,unit = "cm")) +
+                     theme(strip.text = element_blank()), 
+                   g_mean + 
+                     theme(plot.margin = margin(0,0,0,1.5, unit = "cm")) +
+                     theme(strip.text = element_blank()), 
+                   ncol = 2,
+                   rel_heights = c(8,1),
+                   rel_widths = c(8,1))
+dev.off()
+
+
+# Gene ontology enrichment testing
+
+
+if (!file.exists("output/GO_list.Rds")) {
+  library(GO.db)
+  library(org.Mm.eg.db)
+  keys = keys(org.Mm.eg.db)
+  columns(org.Mm.eg.db)
+  GO_info = select(org.Mm.eg.db, keys=keys, columns = c("SYMBOL", "GO"))
+  
+  keep = GO_info$SYMBOL %in% rownames(counts)
+  table(keep)
+  GO_info_filt = GO_info[keep,]
+  
+  # at least 10 genes in the term and less than 500
+  # allTerms = names(which(table(GO_info_filt$GO) >= 10 & table(GO_info_filt$GO) <= 500))
+  sizeTerms = names(which(table(GO_info_filt$GO) >= 10 & table(GO_info_filt$GO) <= 500))
+  
+  # also have at least one of the genes which we actually test
+  testTerms = subset(GO_info_filt, SYMBOL %in% intersect(HVG, nonDEgenes))$GO
+  
+  allTerms = intersect(sizeTerms, testTerms)
+  
+  GO_info_terms = select(GO.db, columns = columns(GO.db), keys = allTerms)
+  rownames(GO_info_terms) <- GO_info_terms$GOID
+  
+  allTermNames = GO_info_terms[allTerms, "TERM"]
+  names(allTermNames) <- allTerms
+  
+  GO_list = sapply(allTerms, function(term) {
+    print(term)
+    genes = GO_info_filt[GO_info_filt$GO == term, "SYMBOL"]
+    return(sort(unique(genes[!is.na(genes)])))
+  }, simplify = FALSE)
+  names(GO_list) <- allTermNames
+  
+  saveRDS(GO_list, file = "output/GO_list.Rds")
+} else {
+  GO_list = readRDS("output/GO_list.Rds")
+}
+if (!file.exists("output/superclusterstotest_GO.Rds")) {
+  superclusterstotest_GO = lapply(geneClustMembers, function(set) {
+    print("testing..")
+    genesetGOtest(set, rownames(counts), GO_list)
+  }
+  )
+  saveRDS(superclusterstotest_GO, file = "output/superclusterstotest_GO.Rds")
+} else {
+  superclusterstotest_GO <- readRDS("output/superclusterstotest_GO.Rds")
+}
+gList = lapply(superclusterstotest_GO, function(pval) {
+  df = data.frame(term = factor(names(pval), levels = c(names(pval), "")),
+                  pval = pval,
+                  qval = p.adjust(pval, method = "BH"))
+  df$label = df$term
+  df$label[pval != 1] <- ""
+  df_sorted = sort_df(df, "pval")[1:10,]
+  df_sorted$term = factor(df_sorted$term, levels =  rev(df_sorted$term))
+  
+  g = ggplot(df_sorted, aes(x = term, y = -log10(pval), fill = qval < 0.05)) +
+    theme_classic() +
+    geom_col() +
+    coord_flip() +
+    xlab("") +
+    ylab("-log10(P-value)") +
+    # geom_hline(yintercept = -log10(0.01), colour = "red", linetype = "dashed", size = 1) +
+    scale_x_discrete(labels = function(x) str_wrap(x, width = 30)) +
+    scale_fill_manual(values = c("TRUE" = "dimgrey", "FALSE" = "peachpuff")) +
+    theme(legend.position = "none") +
+    NULL
+  return(g)
+  
+})
+gTogether = sapply(seq_len(length(gList)), function(i){
+  
+  g_1 = gList[[i]] + 
+    theme(axis.text = element_text(size = 12))
+  n = ggtitle(paste0("Cluster ",i)) 
+  g_2 = gList_cells[[i]] + theme(title = element_text(size = 20)) + 
+    coord_fixed()
+  
+  pdf(paste0("output/go_cluster_plot_cluster_",i,".pdf"), 
+      height = 7, width = 4.5)
+  scater::multiplot(g_2 + n, g_1 + ylab(""), layout = matrix(c(1,1,2,2,2), ncol = 1))
+  dev.off()
+  
+  return(g_1 + g_2)
+}, simplify = FALSE)
+
+
+## Compare different span choices
+
+Using script run on cluster due to high computational demand. Note that the file
+span_output.RData is around 60MB.
+
+```{r}
+if (!file.exists("output/span_output.RData")) {
+  source("span_MOB.R")
+}
+load("output/span_output.RData")
+span_p_all_all = do.call(rbind, span_p_all)
+span_p_all_all$testing <- rep(names(span_p_all), 
+                                         times = unlist(lapply(span_p_all, nrow)))
+span_pvals = do.call(cbind,lapply(span_p_all, "[", "pval"))
+colnames(span_pvals) <- names(span_p_all)
+span_cor = cor(-log10(span_pvals), method = "spearman")
+g = ggpairs(-log10(span_pvals),
+            
+            lower = list(continuous = wrap("points", alpha = 0.3, size=0.1), 
+                         combo = wrap("dot", alpha = 0.4, size=0.2)),
+            title = "-log10(P-value)"
+)
+g
+ggsave(g, file = "output/span_pairs.pdf", height = 12, width = 14)
+pdf("output/span_corrplot.pdf", height = 10, width = 10)
+g_cor = corrplot(span_cor, order = "original")
+dev.off()
+pdf("output/span_upset.pdf", height = 10, width = 16, onefile = FALSE)
+upset(data = as.data.frame(as.matrix(1*(apply(span_pvals,2,p.adjust, method = "BH") < 0.2))),
+      sets = colnames(span_pvals),
+      order.by = "freq",
+      text.scale = 2)
+dev.off()
+# distribution graphs
+span_distn = data.frame(
+    quantile_999 = unlist(lapply(span_perms, function(x) unlist(lapply(x, quantile, probs = 0.999)))),
+    quantile_90 = unlist(lapply(span_perms, function(x) unlist(lapply(x, quantile, probs = 0.90)))),
+    quantile_95 = unlist(lapply(span_perms, function(x) unlist(lapply(x, quantile, probs = 0.95)))),
+    quantile_99 = unlist(lapply(span_perms, function(x) unlist(lapply(x, quantile, probs = 0.99)))),
+    global = unlist(lapply(span_global, "[", span_sampled_ind)),
+    span = rep(names(span_perms), times = unlist(lapply(span_perms, length)))
+)
+span_distn <- reshape::sort_df(span_distn, "global")
+span_distn$quantile_999_fitted = unsplit(lapply(split.data.frame(span_distn, span_distn$span),
+                                                           function(df){
+                                                               loess(quantile_999 ~ global, data = df)$fitted
+                                                           }), span_distn$span)
+span_distn$quantile_90_fitted = unsplit(lapply(split.data.frame(span_distn, span_distn$span),
+                                                          function(df){
+                                                              loess(quantile_90 ~ global, data = df)$fitted
+                                                          }), span_distn$span)
+span_distn$quantile_95_fitted = unsplit(lapply(split.data.frame(span_distn, span_distn$span),
+                                                          function(df){
+                                                              loess(quantile_95 ~ global, data = df)$fitted
+                                                          }), span_distn$span)
+span_distn$quantile_99_fitted = unsplit(lapply(split.data.frame(span_distn, span_distn$span),
+                                                          function(df){
+                                                              loess(quantile_99 ~ global, data = df)$fitted
+                                                          }), span_distn$span)
+span_distn$span = factor(span_distn$span,levels = names(span_perms))
+span_nicecolours = RColorBrewer::brewer.pal(name = "Blues", 9)
+names(span_nicecolours) <- c(rep("", 5), "0.90","0.95","0.99","0.999")
+g = ggplot(span_distn, aes(x = global))  + 
+    
+    geom_point(aes(y = quantile_999, colour = "0.999"),
+               alpha = 0.5) +#, colour = span_nicecolours[9]) +
+    geom_line(aes(y = quantile_999_fitted), colour = span_nicecolours[9]) +
+    
+    geom_point(aes(y = quantile_99, colour = "0.99"),
+               alpha = 0.5) + #, colour = span_nicecolours[8]) +
+    geom_line(aes(y = quantile_99_fitted), colour = span_nicecolours[8]) +
+    
+    geom_point(aes(y = quantile_95, colour = "0.95"),
+               alpha = 0.5) + #, colour = span_nicecolours[7]) +
+    geom_line(aes(y = quantile_95_fitted), colour = span_nicecolours[7]) +
+    
+    geom_point(aes(y = quantile_90, colour = "0.90"),
+               alpha = 0.5) + #, colour = span_nicecolours[6]) +
+    geom_line(aes(y = quantile_90_fitted), colour = span_nicecolours[6]) +
+    facet_wrap(~span, scales = "free", ncol = 4) + 
+    theme_classic() + 
+    xlab("Global higher order statistic value") +
+    ylab("Permuted scHOT test statistic quantile") +
+    scale_colour_manual(name="Quantiles",values=span_nicecolours[6:9]) +
+    theme(legend.position = "bottom") +
+    NULL
+g
+ggsave(g, file = "output/span_pvalEstimation.pdf",
+       height = 12, width = 14)
+
+
+sessionInfo()
+
+length(nonDEgenes)
+
+pairs_sampled
+
+
