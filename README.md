@@ -32,7 +32,7 @@ Environment.sh
 Integrate.sh <countmatrix> <locationfile> <resultfilename> <Demehtod (Trendsceek, Binspect)>
 ```
 
-##Arguments
+## Arguments
 Arguments  |  Description
 ---------  |  -----------
 `$1 <countmatrix>` | A count matrix, genes by spots.
