@@ -4,9 +4,6 @@ author: "YihanXiao"
 date: "4/19/2021"
 ---
 
-```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
-```
 
 # Pipeline for spatial sequencing data
 
