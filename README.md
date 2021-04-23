@@ -13,8 +13,8 @@ The pipeline is composed of for main parts: **Preprocessing**, **Spatial DE gene
 
 ## System requirements
 * Linux/Unix
-* Python (>= 3.0) for MAESTRO snakemake workflow
-* R (>= 3.6.1) for MAESTRO R package
+* Python (>= 3.0) 
+* R (>= 3.6.1) 
 
 ## Environment configuration
 
